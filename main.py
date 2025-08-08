@@ -25,77 +25,74 @@ structlog.configure(
 )
 logger = structlog.get_logger()
 
-def batch_llm_clean(unprocessed_df, column_name, template_name, batch_size=100):
+def batch_llm_clean(unprocessed_df, col, id_cols, semantic_type, target_format, rules, batch_size=120):
     """
     Cleans values in batches using the LLM and returns a combined DataFrame.
-    Accepts unprocessed_df as input, column_name to clean, and template_name for the LLM prompt.
     """
     results = []
-    llm = get_llm_connection()   # create once
+    llm = get_llm_connection()
     for start in range(0, len(unprocessed_df), batch_size):
         batch = unprocessed_df.iloc[start:start+batch_size].copy()
-        cleaned = llm_chat(llm, batch, template_name)
+        cleaned = llm_chat(llm, batch, col, id_cols, semantic_type, target_format, rules)
         results.append(cleaned)
-    return pd.concat(results, ignore_index=True)
+    return pd.concat(results, ignore_index=True) if results else pd.DataFrame(columns=id_cols + [f"{col}_CLEAN"])
 
 def clean_column_with_llm(
-    df,
-    col,
+    df: pd.DataFrame,
+    col: str,
     parse_func,
-    template_name,
-    id_cols=None,
-    batch_size=100,
-):
+    id_cols: list[str],
+    semantic_type: str,
+    target_format: str,
+    rules: list[str],
+    batch_size: int = 120,
+) -> pd.DataFrame:
     """
-    Generalized function to clean a column in a DataFrame using regex and LLM.
-
-    df: DataFrame to clean
-    col: column name to clean (e.g., "BITSIZE", "RPM")
-    parse_func: function to parse/clean the column (e.g., parse_bitsize)
-    template_name: LLM template name (e.g., "BITSIZE", "RPM")
-    id_cols: columns to keep as identifiers (default: ["GUID", "TOURID", "TOURDATE"])
-    batch_size: LLM batch size
-
-    Returns: DataFrame with a new column {col}_CLEAN
+    Column-agnostic cleaning pipeline using regex/LLM.
     """
-    if id_cols is None:
-        id_cols = ["GUID", "TOURID", "TOURDATE"]
-
     clean_col = f"{col}_CLEAN"
     df[clean_col] = df[col].apply(parse_func)
-    logger.info(f"Parsed {col.lower()} values")
-
-    # Find all values that were not processed (i.e., CLEAN is not a float or is NaN)
-    def is_unprocessed(row):
-        val = row[clean_col]
-        return not isinstance(val, float) and not pd.isna(val)
-
-    unprocessed_df = df[df.apply(is_unprocessed, axis=1)][id_cols + [col]].copy()
+    residual_mask = (
+        df[clean_col].isna()
+        | (df[clean_col].astype(str).str.strip() == "")
+        | (df[clean_col].astype(str) == df[col].astype(str))
+    )
+    unprocessed_df = df.loc[residual_mask, id_cols + [col]].copy()
     logger.info(f"Unprocessed {col.lower()} count", count=len(unprocessed_df))
 
     if not unprocessed_df.empty:
-        llm_processed = batch_llm_clean(unprocessed_df, col, template_name, batch_size)
-        # Optionally: merge back into df if needed
+        llm_processed = batch_llm_clean(unprocessed_df, col, id_cols, semantic_type, target_format, rules, batch_size)
         df = df.merge(llm_processed, on=id_cols, how="left", suffixes=("", "_LLM"))
-        df[clean_col] = df[f"{col}_CLEAN_LLM"].combine_first(df[clean_col])
-        df.drop(columns=[f"{col}_CLEAN_LLM"], inplace=True, errors="ignore")
+        df[clean_col] = df[f"{clean_col}_LLM"].combine_first(df[clean_col])
+        df.drop(columns=[f"{clean_col}_LLM"], inplace=True, errors="ignore")
 
-    # Only round the successfully processed (float) values
-    float_mask = df[clean_col].apply(lambda x: isinstance(x, float))
-    df.loc[float_mask, clean_col] = df.loc[float_mask, clean_col].round(4)
-    logger.info(f"Rounded {col.lower()} values", sample=df[clean_col].head(5).tolist())
+    if semantic_type == "numeric" and target_format == "2_decimals":
+        df[clean_col] = pd.to_numeric(df[clean_col], errors="coerce").round(2)
+
     return df
 
 if __name__ == "__main__":
-    sfl_read, sfl_write = get_SFL_connection()
-    logger.info("Starting bit size cleaning")
+    # Example usage with an in-memory DataFrame
+    demo_df = pd.DataFrame({
+        "GUID": ["a", "b"],
+        "TOURID": ["1", "2"],
+        "TOURDATE": ["2024-01-01", "2024-01-02"],
+        "VALUE": ["123.456", "bad data"],
+    })
 
-    df_bitsize = get_zidc_bit_data(sfl_read)
-    logger.info("Loaded data", row_count=len(df_bitsize), columns=list(df_bitsize.columns))
+    def parse_numeric(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
 
-    df_bitsize = clean_column_with_llm(
-        df_bitsize,
-        col="BITSIZE",
-        parse_func=parse_bitsize,
-        template_name="BITSIZE"
+    cleaned_df = clean_column_with_llm(
+        demo_df,
+        col="VALUE",
+        parse_func=parse_numeric,
+        id_cols=["GUID", "TOURID", "TOURDATE"],
+        semantic_type="numeric",
+        target_format="2_decimals",
+        rules=["Extract numbers and format to two decimals"],
     )
+    print(cleaned_df)

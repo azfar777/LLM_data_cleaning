@@ -1,136 +1,78 @@
-from langchain_openai import AzureChatOpenAI
-from typing import Optional, Union
-from regex import template
-from pydantic import create_model, ValidationError
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from typing import List
 from security import Settings, get_settings
 import pandas as pd
-import io
 import json
 
 def get_llm_connection():
     """
-    Return an AzureChatOpenAI client configured from get_settings().
+    Return a ChatOpenAI or AzureChatOpenAI client configured from get_settings().
     """
     settings: Settings = get_settings()
-    llm = AzureChatOpenAI(
-        azure_endpoint=settings.API_ENDPOINT,
-        api_version=settings.API_VERSION,
-        api_key=settings.API_KEY,
-        azure_deployment="alpha-altaml-c-ai-wu-oai-gpt40",
-        model="gpt-4o",
-        temperature=0,
-    )
-    return llm
-
-def get_prompt_template(template_name, df):
-    """
-    Returns a specific prompt template by name with multi-row support.
-    For template_name == "BITSIZE", build a CSV-based prompt that:
-    - Says: "You are a data cleaning expert."
-    - Task: Clean and standardize ONLY the BITSIZE values in the following CSV data.
-    - Do NOT modify GUID, TOURID, or TOURDATE.
-    - Treat the following as missing/null values for BITSIZE:
-      NOV, NOVR, RERUN, N/A, Unknown, UNKN, --, Empty strings
-    - Instructions:
-      1. For each row, clean ONLY the BITSIZE value.
-      2. Extract any valid number from BITSIZE, convert it to float.
-      3. If no number is found in BITSIZE, return null.
-      4. Do not change GUID, TOURID, or TOURDATE.
-      5. Return a new column called BITSIZE_CLEAN.
-    - Output the cleaned data as a valid CSV with columns:
-      GUID,TOURID,TOURDATE,BITSIZE_CLEAN
-    - Only return the cleaned CSV; no code fences or extra text.
-    - Provide a mini example Input/Output in the prompt (like the screenshot), then append the real CSV.
-    """
-    clean_col_name = template_name + "_CLEAN"
-    if template_name == "BITSIZE":
-        csv_input = df.to_csv(index=False)
-        prompt = (
-            "You are a data cleaning expert.\n\n"
-            "Your task is to clean and standardize ONLY the BITSIZE values in the following CSV data.\n\n"
-            "Do NOT modify GUID, TOURID, or TOURDATE. Copy them as-is to the output.\n\n"
-            "Treat the following as missing/null values for BITSIZE:\n"
-            " NOV, NOVR, RERUN, N/A, Unknown, UNKN, --, Empty strings\n\n"
-            "Instructions:\n"
-            "1. For each row, clean ONLY the BITSIZE value.\n"
-            "2. Extract any valid number from BITSIZE, convert it to float.\n"
-            "3. If no number is found in BITSIZE, return null.\n"
-            "4. Do NOT change GUID, TOURID, or TOURDATE.\n"
-            f"5. Return a new column called {clean_col_name}.\n\n"
-            "Output the cleaned data as a valid CSV with the following columns:\n"
-            "GUID,TOURID,TOURDATE,BITSIZE_CLEAN\n\n"
-            "Only return the cleaned CSV. Do not include any explanations or formatting like code blocks.\n\n"
-            "### Example:\n"
-            "Input:\n"
-            "GUID,TOURID,TOURDATE,BITSIZE\n"
-            "abc,1,20280101,NOV\n"
-            "def,2,20280102,12 1/4\\n\n"
-            "Output:\n"
-            "GUID,TOURID,TOURDATE,BITSIZE_CLEAN\n"
-            "abc,1,20280101,\n"
-            "def,2,20280102,12.25\n\n"
-            "### Input CSV:\n"
-            f"{csv_input.strip()}\n"
+    model = getattr(settings, "MODEL", "gpt-4o")
+    deployment = getattr(settings, "AZURE_DEPLOYMENT", model)
+    if getattr(settings, "API_ENDPOINT", None):
+        return AzureChatOpenAI(
+            azure_endpoint=settings.API_ENDPOINT,
+            api_version=settings.API_VERSION,
+            api_key=settings.API_KEY,
+            azure_deployment=deployment,
+            model=model,
+            temperature=0,
         )
-        return prompt.strip()
-    # Default: echo minimal prompt if unknown
-    return "Return the input as CSV."
+    return ChatOpenAI(api_key=settings.API_KEY, model=model, temperature=0)
 
-def llm_chat(llm, df, template_name):
+def build_prompt(col: str, id_cols: List[str], semantic_type: str, target_format: str, rules: List[str], df: pd.DataFrame, max_rows: int = 200) -> str:
     """
-    Sends a message to the LLM using the specified prompt template
-    and returns the df with the cleaned data.
+    Return a single string prompt. The model must output pure JSON Lines (one JSON object per line),
+    each object containing the id columns and a field f"{col}_CLEAN".
+    System instructions to include:
+
+    - "You are a data cleaning expert."
+    - "Normalize ONLY the column `{col}`."
+    - f"semantic_type: {semantic_type}, target_format: {target_format}"
+    - "Apply rules:" + bullet list from `rules`.
+    - "If a value cannot be cleaned, set `{col}_CLEAN` to null."
+    - "Respond as JSON Lines (no code fences, no explanations). Each line must be a valid JSON object 
+       containing ONLY the identifier columns {id_cols} and `{col}_CLEAN`."
+    - Provide the input as a JSON array with only id columns + the dirty column.
     """
-    prompt_template = get_prompt_template(template_name, df)
-    try:
-        response = llm.invoke([prompt_template])
-    except Exception as e:
-        print("LLM invoke failed:", e)
-        raise
+    subset = df[id_cols + [col]].head(max_rows).to_dict(orient="records")
+    rule_lines = "\n".join(f"- {r}" for r in rules) if rules else "- none"
+    prompt = (
+        "You are a data cleaning expert.\n"
+        f"Normalize ONLY the column `{col}`.\n"
+        f"semantic_type: {semantic_type}, target_format: {target_format}\n"
+        "Apply rules:\n"
+        f"{rule_lines}\n"
+        f"If a value cannot be cleaned, set `{col}_CLEAN` to null.\n"
+        f"Respond as JSON Lines (no code fences, no explanations). Each line must be a valid JSON object containing ONLY the identifier columns {id_cols} and `{col}_CLEAN`.\n"
+        "Input:\n"
+        f"{json.dumps(subset, ensure_ascii=False)}"
+    )
+    return prompt
 
-    # Extract content and parse CSV
-    try:
-        if hasattr(response, "content"):
-            raw = response.content.strip()
-        else:
-            raw = str(response).strip()
-            print("Raw LLM response content:", raw[:200])  # preview
-        df_out = parse_llm_response(raw)
-        return df_out
-    except Exception as e:
-        print("Failed to parse LLM output as CSV:", e)
-        raise
-
-def parse_llm_response(response):
+def parse_llm_response(response: str, col: str, id_cols: List[str]) -> pd.DataFrame:
     """
-    Parses the CSV response from the LLM and returns a DataFrame with correct data types.
-    Validates presence of GUID, TOURID, TOURDATE, and that BITSIZE_CLEAN is numeric (float-like).
+    Parses a JSONL response from the LLM and returns a DataFrame.
     """
-    print("DEBUG: Raw LLM response:", response)
-    try:
-        df = pd.read_csv(io.StringIO(response))
-        print("DEBUG: Parsed DataFrame shape:", df.shape)
+    lines = [line for line in response.strip().splitlines() if line.strip()]
+    records = []
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON line: {line}") from e
+        record = {key: obj.get(key) for key in id_cols}
+        record[f"{col}_CLEAN"] = obj.get(f"{col}_CLEAN")
+        records.append(record)
+    return pd.DataFrame(records)
 
-        # Validation step before converting
-        required_columns = ["GUID", "TOURID", "TOURDATE"]
-        for col in required_columns:
-            if col not in df.columns:
-                raise ValueError(f"Missing required column: {col}")
-            if not pd.api.types.is_object_dtype(df[col]):
-                print(f"Warning: Column {col} is not of type object (string-like) before conversion.")
-
-        if "BITSIZE_CLEAN" in df.columns:
-            if not (pd.api.types.is_float_dtype(df["BITSIZE_CLEAN"]) or pd.api.types.is_object_dtype(df["BITSIZE_CLEAN"])):
-                print("Warning: BITSIZE_CLEAN not float-like before conversion.")
-
-        # Enforce correct data types
-        df["GUID"] = df["GUID"].astype(str)
-        df["TOURID"] = df["TOURID"].astype(str)
-        df["TOURDATE"] = df["TOURDATE"].astype(str)
-        if "BITSIZE_CLEAN" in df.columns:
-            df["BITSIZE_CLEAN"] = pd.to_numeric(df["BITSIZE_CLEAN"], errors="coerce")
-
-        return df
-    except Exception as e:
-        print("Failed to parse LLM output as CSV:", e)
-        raise ValueError(f"Failed to parse LLM output as CSV: {e}")
+def llm_chat(llm, df: pd.DataFrame, col: str, id_cols: List[str], semantic_type: str, target_format: str, rules: List[str]) -> pd.DataFrame:
+    """
+    Sends a message to the LLM using the JSONL prompt and returns the cleaned data.
+    """
+    prompt = build_prompt(col, id_cols, semantic_type, target_format, rules, df)
+    response = llm.invoke(prompt)
+    raw = response.content if hasattr(response, "content") else str(response)
+    return parse_llm_response(raw, col, id_cols)
